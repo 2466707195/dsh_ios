@@ -1,0 +1,86 @@
+name: iOS Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "lib/**"
+      - "pubspec.yaml"
+      - "ios/**"
+      - ".github/workflows/ios.yml"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build iOS
+    runs-on: macos-14
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: "zulu"
+          java-version: "17"
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: "stable"
+          flutter-version: "3.27.4"
+          cache: true
+
+      - name: Show versions
+        run: |
+          flutter --version
+          xcodebuild -version
+          pod --version
+
+      # 工程里 lib/ 已存在；--platforms=ios 只补齐 iOS 工程骨架
+      # （project.pbxproj / Podfile / Assets.xcassets 等），不会覆盖已有代码。
+      - name: Ensure iOS scaffold
+        run: flutter create --platforms=ios --org com.dsh --project-name dsh_ios .
+
+      - name: Pub get
+        run: flutter pub get
+
+      - name: Analyze (best-effort)
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Install CocoaPods dependencies
+        working-directory: ios
+        run: pod install
+
+      # 阶段 1：无签名构建，验证工程可编译（产出 .app）
+      - name: Build iOS (no codesign)
+        run: flutter build ios --release --no-codesign
+
+      - name: Upload unsigned .app
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-ios-unsigned-app
+          path: build/ios/iphoneos/Runner.app
+          retention-days: 7
+
+      # 把未签名 .app 按 iOS 规范打包成 .ipa（Payload/Runner.app -> zip）
+      # 未签名 .ipa 不能直接装真机，供你下载后用自己证书重签/侧载。
+      - name: Pack unsigned IPA
+        run: |
+          mkdir -p build/ios/ipa/Payload
+          cp -R build/ios/iphoneos/Runner.app build/ios/ipa/Payload/Runner.app
+          cd build/ios/ipa
+          zip -qry dsh-ios-unsigned.ipa Payload
+          cd -
+          ls -lh build/ios/ipa/dsh-ios-unsigned.ipa
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-ios-unsigned-ipa
+          path: build/ios/ipa/dsh-ios-unsigned.ipa
+          retention-days: 7
