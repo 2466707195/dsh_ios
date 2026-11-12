@@ -55,8 +55,14 @@ jobs:
         working-directory: ios
         run: pod install
 
-      # 阶段 1：无签名构建，验证工程可编译（产出 .app）
+      # 阶段 1：无签名构建（产出真机 arm64 Runner.app）
+      # Flutter 3.5+ 在 CI 上构建 device 即使 --no-codesign 也强制要 Development Team，
+      # 用 CODE_SIGNING_ALLOWED=NO 显式关掉 Xcode 签名校验以在无证书环境编译。
       - name: Build iOS (no codesign)
+        env:
+          CODE_SIGNING_ALLOWED: "NO"
+          CODE_SIGNING_REQUIRED: "NO"
+          CODE_SIGN_IDENTITY: "-"
         run: flutter build ios --release --no-codesign
 
       - name: Upload unsigned .app
