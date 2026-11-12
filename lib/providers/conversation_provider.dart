@@ -22,12 +22,12 @@ class ConversationListState {
   });
 
   Conversation? get current {
-    if (currentId == null) return null;
-    try {
-      return conversations.firstWhere((c) => c.id == currentId);
-    } catch (_) {
-      return null;
+    final id = currentId;
+    if (id == null) return null;
+    for (final c in conversations) {
+      if (c.id == id) return c;
     }
+    return null;
   }
 
   ConversationListState copyWith({
@@ -36,11 +36,10 @@ class ConversationListState {
     bool? isGenerating,
     String? error,
     bool clearError = false,
-    bool clearCurrent = false,
   }) =>
       ConversationListState(
         conversations: conversations ?? this.conversations,
-        currentId: clearCurrent ? null : (currentId ?? this.currentId),
+        currentId: currentId ?? this.currentId,
         isGenerating: isGenerating ?? this.isGenerating,
         error: clearError ? null : (error ?? this.error),
       );
@@ -49,14 +48,14 @@ class ConversationListState {
 class ConversationNotifier extends AsyncNotifier<ConversationListState> {
   final _uuid = const Uuid();
   final _service = DeepSeekService();
-  StreamSubscription? _sub;
+  bool _disposed = false;
 
   @override
   Future<ConversationListState> build() async {
     final storage = ref.read(storageProvider);
     final convs = await storage.loadConversations();
     final currentId = await storage.loadCurrentConversationId();
-    // 如果没有会话，自动创建一个
+
     if (convs.isEmpty) {
       final newConv = _createConversation();
       convs.add(newConv);
@@ -81,6 +80,12 @@ class ConversationNotifier extends AsyncNotifier<ConversationListState> {
     );
   }
 
+  void _replaceConversation(List<Conversation> convs, Conversation updated) {
+    final newState = convs.map((c) => c.id == updated.id ? updated : c).toList();
+    state = AsyncData(state.value!.copyWith(conversations: newState));
+    ref.read(storageProvider).saveConversations(newState);
+  }
+
   void newConversation() {
     final stateVal = state.value;
     if (stateVal == null) return;
@@ -89,36 +94,37 @@ class ConversationNotifier extends AsyncNotifier<ConversationListState> {
     state = AsyncData(stateVal.copyWith(
       conversations: updated,
       currentId: conv.id,
+      clearError: true,
     ));
-    _persist(updated);
+    ref.read(storageProvider).saveConversations(updated);
     ref.read(storageProvider).saveCurrentConversationId(conv.id);
   }
 
   void selectConversation(String id) {
     final stateVal = state.value;
     if (stateVal == null) return;
-    state = AsyncData(stateVal.copyWith(currentId: id));
+    state = AsyncData(stateVal.copyWith(currentId: id, clearError: true));
     ref.read(storageProvider).saveCurrentConversationId(id);
   }
 
   void deleteConversation(String id) {
     final stateVal = state.value;
     if (stateVal == null) return;
-    var updated =
-        stateVal.conversations.where((c) => c.id != id).toList();
-    if (updated.isEmpty) {
+    var remaining = stateVal.conversations.where((c) => c.id != id).toList();
+    if (remaining.isEmpty) {
       final conv = _createConversation();
-      updated = [conv];
+      remaining = [conv];
       state = AsyncData(stateVal.copyWith(
-        conversations: updated,
+        conversations: remaining,
         currentId: conv.id,
       ));
+      ref.read(storageProvider).saveCurrentConversationId(conv.id);
     } else {
-      state = AsyncData(stateVal.copyWith(conversations: updated));
+      final keep = stateVal.currentId == id ? remaining.first.id : stateVal.currentId;
+      state = AsyncData(stateVal.copyWith(conversations: remaining, currentId: keep));
+      ref.read(storageProvider).saveCurrentConversationId(keep);
     }
-    _persist(updated);
-    ref.read(storageProvider)
-        .saveCurrentConversationId(state.value?.currentId);
+    ref.read(storageProvider).saveConversations(remaining);
   }
 
   Future<void> sendMessage(String text) async {
@@ -127,91 +133,60 @@ class ConversationNotifier extends AsyncNotifier<ConversationListState> {
 
     final settings = ref.read(settingsProvider).value;
     if (settings == null || !settings.isConfigured) {
-      state = AsyncData(stateVal.copyWith(
-          error: '请先在设置中配置 API Key'));
+      state = AsyncData(stateVal.copyWith(error: '请先在设置中配置 API Key'));
       return;
     }
 
-    final currentConv = stateVal.current;
-    if (currentConv == null) return;
+    final conv0 = stateVal.current;
+    if (conv0 == null) return;
 
-    // 添加用户消息
     final userMsg = ChatMessage(
       id: _uuid.v4(),
       role: 'user',
       content: text.trim(),
       createdAt: DateTime.now(),
     );
-
-    // 添加占位 assistant 消息
+    final assistantId = _uuid.v4();
     final assistantMsg = ChatMessage(
-      id: _uuid.v4(),
+      id: assistantId,
       role: 'assistant',
       content: '',
       createdAt: DateTime.now(),
       isStreaming: true,
     );
 
-    // 更新会话
-    final updatedMessages = [
-      ...currentConv.messages,
-      userMsg,
-      assistantMsg,
-    ];
-    final updatedConv = Conversation(
-      id: currentConv.id,
-      title: currentConv.messages.isEmpty ? text.trim() : currentConv.title,
-      messages: updatedMessages,
-      createdAt: currentConv.createdAt,
+    final withUser = Conversation(
+      id: conv0.id,
+      title: conv0.messages.isEmpty ? text.trim() : conv0.title,
+      messages: [...conv0.messages, userMsg, assistantMsg],
+      createdAt: conv0.createdAt,
       updatedAt: DateTime.now(),
     );
+    _replaceConversation(stateVal.conversations, withUser);
+    state = AsyncData(state.value!.copyWith(isGenerating: true, clearError: true));
 
-    final updatedConvs = stateVal.conversations
-        .map((c) => c.id == currentConv.id ? updatedConv : c)
-        .toList();
+    // 发送给 API 的历史（不含占位 assistant）
+    final history = [...conv0.messages, userMsg];
 
-    state = AsyncData(stateVal.copyWith(
-      conversations: updatedConvs,
-      isGenerating: true,
-      clearError: true,
-    ));
-    _persist(updatedConvs);
-
-    // 构建历史消息（不含占位 assistant）
-    final history = updatedMessages
-        .where((m) => m.id != assistantMsg.id)
-        .toList();
+    final String convId = withUser.id;
+    void patchAssistant(ChatMessage patched) {
+      if (_disposed) return;
+      final sv = state.value;
+      if (sv == null) return;
+      final conv = sv.current;
+      if (conv == null || conv.id != convId) return;
+      final msgs = conv.messages.map((m) => m.id == assistantId ? patched : m).toList();
+      final updated = Conversation(
+        id: conv.id,
+        title: conv.title,
+        messages: msgs,
+        createdAt: conv.createdAt,
+        updatedAt: DateTime.now(),
+      );
+      _replaceConversation(sv.conversations, updated);
+    }
 
     try {
-      // 更新 assistant 消息内容的回调
-      void updateAssistant(String content, {String? reasoning}) {
-        final sv = state.value;
-        if (sv == null) return;
-        final conv = sv.current;
-        if (conv == null) return;
-        final msgs = conv.messages.map((m) {
-          if (m.id == assistantMsg.id) {
-            return m.copyWith(
-              content: content,
-              reasoningContent: reasoning,
-            );
-          }
-          return m;
-        }).toList();
-
-        final uc = Conversation(
-          id: conv.id,
-          title: conv.title,
-          messages: msgs,
-          createdAt: conv.createdAt,
-          updatedAt: DateTime.now(),
-        );
-        final ucs = sv.conversations
-            .map((c) => c.id == conv.id ? uc : c)
-            .toList();
-        state = AsyncData(sv.copyWith(conversations: ucs));
-      }
-
       String contentAcc = '';
       String reasoningAcc = '';
 
@@ -222,84 +197,57 @@ class ConversationNotifier extends AsyncNotifier<ConversationListState> {
         history: history,
         onDelta: (delta) {
           contentAcc += delta;
-          updateAssistant(contentAcc,
-              reasoning: reasoningAcc.isEmpty ? null : reasoningAcc);
+          patchAssistant(ChatMessage(
+            id: assistantId,
+            role: 'assistant',
+            content: contentAcc,
+            reasoningContent: reasoningAcc.isEmpty ? null : reasoningAcc,
+            createdAt: assistantMsg.createdAt,
+            isStreaming: true,
+          ));
         },
         onReasoning: (delta) {
           reasoningAcc += delta;
-          updateAssistant(contentAcc, reasoning: reasoningAcc);
+          patchAssistant(ChatMessage(
+            id: assistantId,
+            role: 'assistant',
+            content: contentAcc,
+            reasoningContent: reasoningAcc,
+            createdAt: assistantMsg.createdAt,
+            isStreaming: true,
+          ));
         },
       );
 
-      // 最终更新：标记流结束
-      final sv = state.value;
-      if (sv != null) {
-        final conv = sv.current;
-        if (conv != null) {
-          final msgs = conv.messages.map((m) {
-            if (m.id == assistantMsg.id) {
-              return ChatMessage(
-                id: m.id,
-                role: m.role,
-                content: result.content,
-                reasoningContent: result.reasoningContent,
-                createdAt: m.createdAt,
-                isStreaming: false,
-              );
-            }
-            return m;
-          }).toList();
-          final uc = Conversation(
-            id: conv.id,
-            title: conv.title,
-            messages: msgs,
-            createdAt: conv.createdAt,
-            updatedAt: DateTime.now(),
-          );
-          final ucs = sv.conversations
-              .map((c) => c.id == conv.id ? uc : c)
-              .toList();
-          state = AsyncData(sv.copyWith(conversations: ucs, isGenerating: false));
-          _persist(ucs);
-        }
+      patchAssistant(ChatMessage(
+        id: assistantId,
+        role: 'assistant',
+        content: result.content,
+        reasoningContent: result.reasoningContent,
+        createdAt: assistantMsg.createdAt,
+        isStreaming: false,
+      ));
+
+      if (!_disposed) {
+        state = AsyncData(state.value?.copyWith(isGenerating: false) ??
+            stateVal.copyWith(isGenerating: false));
       }
     } catch (e) {
-      // 回填错误信息到 assistant 消息
-      final sv = state.value;
-      if (sv != null) {
-        final conv = sv.current;
-        if (conv != null) {
-          final msgs = conv.messages.map((m) {
-            if (m.id == assistantMsg.id) {
-              return m.copyWith(
-                content: '❌ 请求失败: ${e.toString()}',
-                isStreaming: false,
-              );
-            }
-            return m;
-          }).toList();
-          final uc = Conversation(
-            id: conv.id,
-            title: conv.title,
-            messages: msgs,
-            createdAt: conv.createdAt,
-            updatedAt: DateTime.now(),
-          );
-          final ucs = sv.conversations
-              .map((c) => c.id == conv.id ? uc : c)
-              .toList();
-          state = AsyncData(sv.copyWith(
-              conversations: ucs,
-              isGenerating: false,
-              error: e.toString()));
-          _persist(ucs);
-        }
+      patchAssistant(ChatMessage(
+        id: assistantId,
+        role: 'assistant',
+        content: '❌ 请求失败: ${e.toString()}',
+        createdAt: assistantMsg.createdAt,
+        isStreaming: false,
+      ));
+      if (!_disposed) {
+        final sv = state.value;
+        state = AsyncData((sv ?? stateVal).copyWith(isGenerating: false, error: e.toString()));
       }
     }
   }
 
   void stopGenerating() {
-    _sub?.cancel();
     final sv = state.value;
     if (sv != null) {
       state = AsyncData(sv.copyWith(isGenerating: false));
@@ -313,8 +261,11 @@ class ConversationNotifier extends AsyncNotifier<ConversationListState> {
     }
   }
 
-  void _persist(List<Conversation> convs) {
-    ref.read(storageProvider).saveConversations(convs);
+  @override
+  void dispose() {
+    _disposed = true;
+    _service.dispose();
+    super.dispose();
   }
 }
 

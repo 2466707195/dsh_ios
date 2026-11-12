@@ -1,7 +1,5 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_markdown/flutter_markdown.dart';
-import 'package:flutter_highlight/flutter_highlight.dart';
-import 'package:flutter_highlight/themes/github.dart';
 import '../models/chat_message.dart';
 
 class MessageBubble extends StatelessWidget {
@@ -82,23 +80,13 @@ class MessageBubble extends StatelessWidget {
           color: Colors.grey.shade100,
           borderRadius: BorderRadius.circular(8),
         ),
+        codeblockPadding: const EdgeInsets.all(12),
+        codeblockTextStyle: const TextStyle(
+          fontFamily: 'monospace',
+          fontSize: 13,
+          height: 1.4,
+        ),
       ),
-      codeBuilder: (context, code, language) {
-        return SizedBox(
-          width: double.infinity,
-          child: HighlightView(
-            code,
-            language: language,
-            theme: githubTheme,
-            padding: const EdgeInsets.all(12),
-            textStyle: const TextStyle(
-              fontFamily: 'monospace',
-              fontSize: 13,
-              height: 1.4,
-            ),
-          ),
-        );
-      },
     );
   }
 }

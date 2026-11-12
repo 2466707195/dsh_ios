@@ -1,3 +1,5 @@
+import 'chat_message.dart';
+
 /// 一个会话（对话线程）
 class Conversation {
   final String id;
@@ -12,8 +14,7 @@ class Conversation {
     List<ChatMessage>? messages,
     required this.createdAt,
     required this.updatedAt,
-  })  : messages = messages ?? [],
-        updatedAt = updatedAt;
+  }) : messages = messages ?? [];
 
   Map<String, dynamic> toJson() => {
         'id': id,
