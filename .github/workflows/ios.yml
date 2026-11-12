@@ -56,22 +56,34 @@ jobs:
         run: pod install
 
       # 阶段 1：无签名构建（产出真机 arm64 Runner.app）
-      # Flutter 3.5+ 在把构建交给 Xcode 前会校验 project.pbxproj 里的 DEVELOPMENT_TEAM，
-      # 空值直接报 "requires a selected Development Team"。CI 无证书，
-      # 注入一个占位 team 绕过该校验，真正签名留给你本地完成。
-      - name: Inject placeholder Development Team
-        working-directory: ios
-        run: |
-          PROJ="Runner.xcodeproj/project.pbxproj"
-          sed -i.bak 's/CODE_SIGN_STYLE = Automatic;/DEVELOPMENT_TEAM = PLACEHOLDERTEAM;\n\t\t\tCODE_SIGN_STYLE = Manual;/g' "$PROJ"
-          grep -c "DEVELOPMENT_TEAM" "$PROJ" || echo "no injection anchor found"
-
-      - name: Build iOS (no codesign)
+      # Flutter CLI 构建真机前会做独立的 team 校验（即使 --no-codesign + 占位 team 也拦）。
+      # 改用两步绕开：先 --config-only 让 Flutter 准备好原生工程与 Pod，
+      # 再用 xcodebuild 直接编译真机 arm64 且关闭签名，产出未签名 Runner.app。
+      - name: Prepare native project (config-only)
         env:
           CODE_SIGNING_ALLOWED: "NO"
-          CODE_SIGNING_REQUIRED: "NO"
-          CODE_SIGN_IDENTITY: "-"
-        run: flutter build ios --release --no-codesign
+        run: flutter build ios --release --config-only
+
+      - name: Build unsigned device .app via xcodebuild
+        working-directory: ios
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -workspace Runner.xcworkspace \
+            -scheme Runner \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/DerivedData \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            build | tail -40
+          APP=$(find build/DerivedData/Build/Products -name "Runner.app" -type d | head -1)
+          echo "APP=$APP"
+          mkdir -p ../build/ios/iphoneos
+          cp -R "$APP" ../build/ios/iphoneos/Runner.app
+          ls -lh ../build/ios/iphoneos/Runner.app
 
       - name: Upload unsigned .app
         uses: actions/upload-artifact@v4
