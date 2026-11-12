@@ -56,9 +56,12 @@ jobs:
         run: pod install
 
       # 阶段 1：无签名构建（产出真机 arm64 Runner.app）
-      # Flutter CLI 构建真机前会做独立的 team 校验（即使 --no-codesign + 占位 team 也拦）。
-      # 改用两步绕开：先 --config-only 让 Flutter 准备好原生工程与 Pod，
-      # 再用 xcodebuild 直接编译真机 arm64 且关闭签名，产出未签名 Runner.app。
+      # Flutter CLI 仅在工程为 Automatic signing 时强制校验 team/证书。把工程切成
+      # Manual + ad-hoc 身份("-") + 占位 team 即可让无证书 CI 编译真机 .app，
+      # 该 .app 未经正式签名，正式签名留给你本地用自己证书完成。
+      - name: Switch project to manual ad-hoc signing
+        run: python3 tooling/fix_signing.py ios/Runner.xcodeproj/project.pbxproj
+
       - name: Prepare native project (config-only)
         env:
           CODE_SIGNING_ALLOWED: "NO"
@@ -74,13 +77,13 @@ jobs:
             -configuration Release \
             -sdk iphoneos \
             -derivedDataPath build/DerivedData \
-            CODE_SIGNING_ALLOWED=NO \
-            CODE_SIGNING_REQUIRED=NO \
-            CODE_SIGN_IDENTITY="" \
-            DEVELOPMENT_TEAM="" \
-            build | tail -40
+            CODE_SIGN_IDENTITY="-" \
+            DEVELOPMENT_TEAM=AAAAAAAAAA \
+            CODE_SIGN_STYLE=Manual \
+            build | tail -50
           APP=$(find build/DerivedData/Build/Products -name "Runner.app" -type d | head -1)
           echo "APP=$APP"
+          test -n "$APP"
           mkdir -p ../build/ios/iphoneos
           cp -R "$APP" ../build/ios/iphoneos/Runner.app
           ls -lh ../build/ios/iphoneos/Runner.app
