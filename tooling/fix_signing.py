@@ -15,18 +15,26 @@ DUMMY_TEAM = "AAAAAAAAAA"  # 10 位占位 team id（ad-hoc 不校验其真实性
 # 1) 签名风格改为 Manual（Flutter 仅在 Automatic 时强制要 team）
 src = re.sub(r"CODE_SIGN_STYLE = \w+;", "CODE_SIGN_STYLE = Manual;", src)
 
-# 2) 所有（含空的）DEVELOPMENT_TEAM 统一设为占位值
-src = re.sub(r"DEVELOPMENT_TEAM = [^;]*;", f"DEVELOPMENT_TEAM = {DUMMY_TEAM};", src)
+# 2) DEVELOPMENT_TEAM：有则改值，无则在 Manual 后插入（避免重复键）
+if "DEVELOPMENT_TEAM" in src:
+    src = re.sub(r"DEVELOPMENT_TEAM = [^;]*;", f"DEVELOPMENT_TEAM = {DUMMY_TEAM};", src)
+    inserted = 0
+else:
+    src, inserted = re.subn(
+        r"(CODE_SIGN_STYLE = Manual;)",
+        f"DEVELOPMENT_TEAM = {DUMMY_TEAM};\\n\\t\\t\\t\\1",
+        src,
+    )
 
-# 3) 注入 ad-hoc 签名身份 "-"（无需证书）；仅当尚无该键时插入，避免重复键
-if "CODE_SIGN_IDENTITY" not in src:
+# 3) ad-hoc 签名身份 "-"：有则改值，无则插入
+if "CODE_SIGN_IDENTITY" in src:
+    src = re.sub(r'CODE_SIGN_IDENTITY = [^;]*;', 'CODE_SIGN_IDENTITY = "-";', src)
+else:
     src = re.sub(
         r"(CODE_SIGN_STYLE = Manual;)",
         'CODE_SIGN_IDENTITY = "-";\\n\\t\\t\\t\\1',
         src,
     )
-else:
-    src = re.sub(r'CODE_SIGN_IDENTITY = [^;]*;', 'CODE_SIGN_IDENTITY = "-";', src)
 
 with open(path, "w", encoding="utf-8") as f:
     f.write(src)
