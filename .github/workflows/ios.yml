@@ -56,8 +56,16 @@ jobs:
         run: pod install
 
       # 阶段 1：无签名构建（产出真机 arm64 Runner.app）
-      # Flutter 3.5+ 在 CI 上构建 device 即使 --no-codesign 也强制要 Development Team，
-      # 用 CODE_SIGNING_ALLOWED=NO 显式关掉 Xcode 签名校验以在无证书环境编译。
+      # Flutter 3.5+ 在把构建交给 Xcode 前会校验 project.pbxproj 里的 DEVELOPMENT_TEAM，
+      # 空值直接报 "requires a selected Development Team"。CI 无证书，
+      # 注入一个占位 team 绕过该校验，真正签名留给你本地完成。
+      - name: Inject placeholder Development Team
+        working-directory: ios
+        run: |
+          PROJ="Runner.xcodeproj/project.pbxproj"
+          sed -i.bak 's/CODE_SIGN_STYLE = Automatic;/DEVELOPMENT_TEAM = PLACEHOLDERTEAM;\n\t\t\tCODE_SIGN_STYLE = Manual;/g' "$PROJ"
+          grep -c "DEVELOPMENT_TEAM" "$PROJ" || echo "no injection anchor found"
+
       - name: Build iOS (no codesign)
         env:
           CODE_SIGNING_ALLOWED: "NO"
