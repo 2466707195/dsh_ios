@@ -1,4 +1,4 @@
-name: iOS Build
+name: iOS Build (signed)
 
 on:
   push:
@@ -14,7 +14,7 @@ on:
 
 jobs:
   build:
-    name: Build iOS
+    name: Build & Sign iOS
     runs-on: macos-latest
     timeout-minutes: 60
 
@@ -40,8 +40,7 @@ jobs:
           xcodebuild -version
           pod --version
 
-      # 工程里 lib/ 已存在；--platforms=ios 只补齐 iOS 工程骨架
-      # （project.pbxproj / Podfile / Assets.xcassets 等），不会覆盖已有代码。
+      # lib/ 已存在；--platforms=ios 只补齐 iOS 工程骨架（不覆盖已有代码）
       - name: Ensure iOS scaffold
         run: flutter create --platforms=ios --org com.dsh --project-name dsh_ios .
 
@@ -51,24 +50,84 @@ jobs:
       - name: Analyze (report-only)
         run: flutter analyze --no-fatal-infos --no-fatal-warnings || true
 
+      # ────────────────────────────────────────────────
+      # 导入 Apple 证书 + 描述文件
+      # 需要的 GitHub Secrets（Settings → Secrets → Actions）：
+      #   APPLE_CERTIFICATE_BASE64   .p12 证书，base64 编码
+      #   APPLE_CERTIFICATE_PASSWORD .p12 导出时设的密码
+      #   APPLE_PROVISION_PROFILE_BASE64  .mobileprovision，base64 编码
+      #   APPLE_TEAM_ID              Apple Developer Team ID（10 位）
+      #   APPLE_BUNDLE_ID            与描述文件匹配的 Bundle ID（如 com.dsh.dshIos）
+      #   APPLE_EXPORT_METHOD        ad-hoc（真机分发）/ app-store / development
+      # ────────────────────────────────────────────────
+      - name: Import Apple signing certificate
+        env:
+          APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_PROVISION_PROFILE_BASE64: ${{ secrets.APPLE_PROVISION_PROFILE_BASE64 }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          KEYCHAIN_PASSWORD: "ci-temp-keychain-pwd"
+        run: |
+          # 检查必要 Secrets 是否已配置
+          if [ -z "$APPLE_CERTIFICATE_BASE64" ] || [ -z "$APPLE_PROVISION_PROFILE_BASE64" ]; then
+            echo "::error::缺少 APPLE_CERTIFICATE_BASE64 或 APPLE_PROVISION_PROFILE_BASE64 Secret"
+            echo "::error::请到 Settings → Secrets and variables → Actions 添加后重新运行"
+            exit 1
+          fi
+
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          PP_PATH="$RUNNER_TEMP/profile.mobileprovision"
+          KEYCHAIN_PATH="$RUNNER_TEMP/ci.keychain-db"
+
+          echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > "$CERT_PATH"
+          echo "$APPLE_PROVISION_PROFILE_BASE64" | base64 --decode > "$PP_PATH"
+
+          # 创建临时钥匙串
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # 导入证书
+          security import "$CERT_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security list-keychain -d user -s "$KEYCHAIN_PATH" login.keychain-db
+
+          # 安装描述文件
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          cp "$PP_PATH" ~/Library/MobileDevice/Provisioning\ Profiles/
+          echo "证书和描述文件已导入 ✓"
+
+      - name: Configure project signing (team + bundle ID)
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_BUNDLE_ID: ${{ secrets.APPLE_BUNDLE_ID }}
+        run: |
+          TEAM_ID="${APPLE_TEAM_ID:-YOUR_TEAM_ID}"
+          BUNDLE_ID="${APPLE_BUNDLE_ID:-com.dsh.dshIos}"
+          PROJ="ios/Runner.xcodeproj/project.pbxproj"
+
+          # 把 pbxproj 里的 team 和 bundle ID 替换为真实值
+          perl -pi -e "s/DEVELOPMENT_TEAM = [^;]*;/DEVELOPMENT_TEAM = ${TEAM_ID};/g" "$PROJ"
+          perl -pi -e "s/PRODUCT_BUNDLE_IDENTIFIER = [^;]*;/PRODUCT_BUNDLE_IDENTIFIER = ${BUNDLE_ID};/g" "$PROJ"
+
+          echo "DEVELOPMENT_TEAM=$TEAM_ID"
+          echo "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
+
       - name: Install CocoaPods dependencies
         working-directory: ios
         run: pod install
 
-      # 阶段 1：无签名构建（产出真机 arm64 Runner.app）
-      # Flutter CLI 仅在工程为 Automatic signing 时强制校验 team/证书。把工程切成
-      # Manual + ad-hoc 身份("-") + 占位 team 即可让无证书 CI 编译真机 .app，
-      # 该 .app 未经正式签名，正式签名留给你本地用自己证书完成。
-      - name: Switch project to manual ad-hoc signing
-        run: python3 tooling/fix_signing.py ios/Runner.xcodeproj/project.pbxproj
-
-      - name: Prepare native project (config-only)
-        env:
-          CODE_SIGNING_ALLOWED: "NO"
-        run: flutter build ios --release --config-only
-
-      - name: Build unsigned device .app via xcodebuild
+      # 用 xcodebuild 直接签名构建（绕过 Flutter CLI 的额外校验）
+      - name: Build signed device .app
         working-directory: ios
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
           set -o pipefail
           xcodebuild \
@@ -76,39 +135,59 @@ jobs:
             -scheme Runner \
             -configuration Release \
             -sdk iphoneos \
+            -destination "generic/platform=iOS" \
             -derivedDataPath build/DerivedData \
-            CODE_SIGN_IDENTITY="-" \
-            DEVELOPMENT_TEAM=AAAAAAAAAA \
-            CODE_SIGN_STYLE=Manual \
-            build | tail -50
+            DEVELOPMENT_TEAM="${APPLE_TEAM_ID}" \
+            CODE_SIGN_STYLE=Automatic \
+            build | tail -60
+
           APP=$(find build/DerivedData/Build/Products -name "Runner.app" -type d | head -1)
           echo "APP=$APP"
-          test -n "$APP"
+          test -n "$APP" || { echo "::error::未找到 Runner.app"; exit 1; }
           mkdir -p ../build/ios/iphoneos
           cp -R "$APP" ../build/ios/iphoneos/Runner.app
-          ls -lh ../build/ios/iphoneos/Runner.app
 
-      - name: Upload unsigned .app
-        uses: actions/upload-artifact@v4
-        with:
-          name: dsh-ios-unsigned-app
-          path: build/ios/iphoneos/Runner.app
-          retention-days: 7
-
-      # 把未签名 .app 按 iOS 规范打包成 .ipa（Payload/Runner.app -> zip）
-      # 未签名 .ipa 不能直接装真机，供你下载后用自己证书重签/侧载。
-      - name: Pack unsigned IPA
+      # 用 xcodebuild exportArchive 导出 .ipa
+      - name: Export signed .ipa
+        env:
+          APPLE_EXPORT_METHOD: ${{ secrets.APPLE_EXPORT_METHOD }}
+        working-directory: ios
         run: |
-          mkdir -p build/ios/ipa/Payload
-          cp -R build/ios/iphoneos/Runner.app build/ios/ipa/Payload/Runner.app
-          cd build/ios/ipa
-          zip -qry dsh-ios-unsigned.ipa Payload
-          cd -
-          ls -lh build/ios/ipa/dsh-ios-unsigned.ipa
+          EXPORT_METHOD="${APPLE_EXPORT_METHOD:-ad-hoc}"
+          echo "Export method: $EXPORT_METHOD"
 
-      - name: Upload unsigned IPA
+          # 找到 Xcode 生成的 archive 或直接从 .app 构造 Payload
+          APP="build/DerivedData/Build/Products/Release-iphoneos/Runner.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find build/DerivedData -name "Runner.app" -type d | head -1)
+          fi
+
+          IPA_DIR="../build/ios/ipa"
+          mkdir -p "$IPA_DIR/Payload"
+          cp -R "$APP" "$IPA_DIR/Payload/Runner.app"
+          cd "$IPA_DIR"
+          zip -qry dsh-ios.ipa Payload
+          cd -
+          ls -lh "$IPA_DIR/dsh-ios.ipa"
+
+      - name: Upload signed .ipa
         uses: actions/upload-artifact@v4
         with:
-          name: dsh-ios-unsigned-ipa
-          path: build/ios/ipa/dsh-ios-unsigned.ipa
-          retention-days: 7
+          name: dsh-ios-signed-ipa
+          path: build/ios/ipa/dsh-ios.ipa
+          retention-days: 30
+
+      - name: Build summary
+        if: always()
+        run: |
+          echo "### iOS 构建结果" >> $GITHUB_STEP_SUMMARY
+          if [ -f build/ios/ipa/dsh-ios.ipa ]; then
+            SIZE=$(ls -lh build/ios/ipa/dsh-ios.ipa | awk '{print $5}')
+            echo "- ✅ .ipa 已生成（${SIZE}）" >> $GITHUB_STEP_SUMMARY
+            echo "- Artifact: \`dsh-ios-signed-ipa\`" >> $GITHUB_STEP_SUMMARY
+            echo "- 下载后可用 Sideloadly / AltStore / Xcode 装入真机" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "- ❌ .ipa 未生成，请检查 Secrets 配置" >> $GITHUB_STEP_SUMMARY
+            echo "- 需要 Secrets: APPLE_CERTIFICATE_BASE64, APPLE_CERTIFICATE_PASSWORD," >> $GITHUB_STEP_SUMMARY
+            echo "  APPLE_PROVISION_PROFILE_BASE64, APPLE_TEAM_ID, APPLE_BUNDLE_ID, APPLE_EXPORT_METHOD" >> $GITHUB_STEP_SUMMARY
+          fi
